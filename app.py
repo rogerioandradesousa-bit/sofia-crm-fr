@@ -1,0 +1,296 @@
+import os, sqlite3, secrets, re
+from datetime import datetime
+from functools import wraps
+from flask import Flask, request, redirect, url_for, session, flash, render_template_string, jsonify
+from werkzeug.security import generate_password_hash, check_password_hash
+from markupsafe import escape
+
+BASE=os.path.dirname(__file__)
+DB=os.path.join(BASE,'crm.db')
+app=Flask(__name__)
+app.secret_key=os.environ.get('SECRET_KEY') or secrets.token_hex(32)
+STAGES=['Novo lead','Em atendimento','Qualificado','Imóvel apresentado','Visita agendada','Proposta','Negociação','Venda concluída','Perdido']
+
+def conn():
+ c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;c.execute('PRAGMA foreign_keys=ON');return c
+
+def init():
+ with conn() as c:
+  c.executescript('''CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'corretor');
+ CREATE TABLE IF NOT EXISTS leads(id INTEGER PRIMARY KEY,name TEXT NOT NULL,phone TEXT,email TEXT,source TEXT,interest TEXT,neighborhood TEXT,budget REAL,stage TEXT DEFAULT 'Novo lead',owner_id INTEGER,notes TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(owner_id) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS properties(id INTEGER PRIMARY KEY,title TEXT NOT NULL,kind TEXT,city TEXT,neighborhood TEXT,bedrooms INTEGER,price REAL,area REAL,description TEXT,status TEXT DEFAULT 'Disponível',created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+ CREATE TABLE IF NOT EXISTS visits(id INTEGER PRIMARY KEY,lead_id INTEGER NOT NULL,property_id INTEGER,owner_id INTEGER,scheduled_at TEXT NOT NULL,status TEXT DEFAULT 'Agendada',notes TEXT,FOREIGN KEY(lead_id) REFERENCES leads(id),FOREIGN KEY(property_id) REFERENCES properties(id),FOREIGN KEY(owner_id) REFERENCES users(id));
+ CREATE TABLE IF NOT EXISTS activities(id INTEGER PRIMARY KEY,lead_id INTEGER,actor_id INTEGER,kind TEXT,details TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+ CREATE INDEX IF NOT EXISTS ix_leads_stage ON leads(stage); CREATE INDEX IF NOT EXISTS ix_visits_date ON visits(scheduled_at);''')
+  if not c.execute('SELECT 1 FROM users').fetchone():
+   pwd=os.environ.get('ADMIN_PASSWORD')
+   if not pwd:
+    pwd=secrets.token_urlsafe(12)
+    print('\n'+'='*55+'\nACESSO INICIAL (guarde a senha):\nEmail: admin@fr.local\nSenha: '+pwd+'\n'+'='*55+'\n',flush=True)
+   c.execute('INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)',('Administrador','admin@fr.local',generate_password_hash(pwd),'admin'))
+init()
+
+def migrate():
+ with conn() as c:
+  c.execute("CREATE TABLE IF NOT EXISTS teams(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE,manager_id INTEGER REFERENCES users(id),created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+  cols={r['name'] for r in c.execute('PRAGMA table_info(users)')}
+  if 'team_id' not in cols:c.execute('ALTER TABLE users ADD COLUMN team_id INTEGER REFERENCES teams(id)')
+  if 'active' not in cols:c.execute('ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1')
+  c.execute('CREATE INDEX IF NOT EXISTS ix_users_team ON users(team_id)')
+  c.execute('CREATE INDEX IF NOT EXISTS ix_leads_owner ON leads(owner_id)')
+migrate()
+
+def visible_filter(alias='l'):
+ role=session.get('role');uid=session.get('uid')
+ if role=='admin':return ('1=1',[])
+ if role=='gestor':return (f"({alias}.owner_id=? OR {alias}.owner_id IN (SELECT id FROM users WHERE team_id IN (SELECT id FROM teams WHERE manager_id=?)))",[uid,uid])
+ return (f'{alias}.owner_id=?',[uid])
+
+def can_access_lead(c,lead_id):
+ where,args=visible_filter('l')
+ return c.execute(f'SELECT 1 FROM leads l WHERE l.id=? AND {where}',[lead_id,*args]).fetchone() is not None
+
+def can_assign(c,owner_id):
+ if not owner_id:return session.get('role')=='admin'
+ if session.get('role')=='admin':return c.execute('SELECT 1 FROM users WHERE id=? AND active=1',(owner_id,)).fetchone() is not None
+ if session.get('role')=='gestor':return c.execute('SELECT 1 FROM users WHERE id=? AND active=1 AND (id=? OR team_id IN (SELECT id FROM teams WHERE manager_id=?))',(owner_id,session['uid'],session['uid'])).fetchone() is not None
+ return owner_id==session.get('uid')
+
+def auto_owner(c):
+ # Fair rotation by smallest number of assigned leads, then user id.
+ row=c.execute("""SELECT u.id FROM users u LEFT JOIN leads l ON l.owner_id=u.id WHERE u.active=1 AND u.role='corretor' GROUP BY u.id ORDER BY count(l.id),u.id LIMIT 1""").fetchone()
+ return row['id'] if row else None
+
+def login_required(f):
+ @wraps(f)
+ def wrapper(*a,**kw):
+  if not session.get('uid'):return redirect(url_for('login'))
+  return f(*a,**kw)
+ return wrapper
+
+def admin_required(f):
+ @wraps(f)
+ def wrapper(*a,**kw):
+  if session.get('role')!='admin':flash('Acesso restrito ao administrador.');return redirect('/')
+  return f(*a,**kw)
+ return wrapper
+
+def csrf():
+ if '_csrf' not in session:session['_csrf']=secrets.token_urlsafe(24)
+ return session['_csrf']
+@app.before_request
+def protect():
+ if request.method=='POST' and request.endpoint not in ('api_whatsapp',):
+  if not secrets.compare_digest(request.form.get('_csrf',''),csrf()):return 'Solicitação inválida (CSRF)',400
+
+STYLE='''<style>*{box-sizing:border-box}body{margin:0;background:#f5f6f8;color:#17191c;font-family:Inter,Arial,sans-serif}a{color:inherit;text-decoration:none}.layout{display:flex;min-height:100vh}.sidebar{width:245px;background:#101215;color:white;padding:28px 17px;flex-shrink:0}.brand{font-size:22px;font-weight:850;letter-spacing:-.6px}.sub{font-size:11px;color:#aab0b8;margin:6px 0 28px;letter-spacing:2px}.nav a{display:block;padding:12px 14px;border-radius:10px;margin:4px 0;color:#cdd0d5;font-size:14px}.nav a:hover,.nav a.active{background:#2b3036;color:#fff}.main{padding:30px 34px;width:100%;min-width:0}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:15px}.muted{color:#747b86;font-size:13px}h1{font-size:27px;letter-spacing:-.7px;margin:0 0 7px}h2{font-size:18px;margin:0 0 16px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px}.card{background:white;border:1px solid #e6e8ed;border-radius:15px;padding:20px;margin-bottom:17px;box-shadow:0 2px 6px #00000004}.metric{font-size:32px;font-weight:800;margin-top:12px}.label{color:#777e87;font-size:12px;text-transform:uppercase;letter-spacing:.7px}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#6c7480;font-weight:600;border-bottom:1px solid #e8eaf0;padding:13px 10px}td{border-bottom:1px solid #f0f1f3;padding:13px 10px}input,select,textarea{padding:11px 12px;border:1px solid #d9dde3;border-radius:9px;width:100%;background:white;font:inherit;color:#17191c}textarea{min-height:76px}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.field label{display:block;font-size:12px;color:#555d66;margin-bottom:6px}.btn{display:inline-block;background:#111418;color:#fff;padding:11px 15px;border:0;border-radius:9px;cursor:pointer;font-size:13px;font-weight:650}.btn.secondary{background:#e9ecf0;color:#20242a}.btn.small{padding:7px 10px}.pill{background:#f0f2f4;border-radius:50px;padding:5px 9px;font-size:11px;white-space:nowrap}.board{display:flex;gap:12px;overflow-x:auto;padding-bottom:10px}.lane{background:#e9ecf0;border-radius:13px;padding:13px;min-width:205px;max-width:205px;min-height:230px}.leadcard{background:#fff;border-radius:10px;padding:13px;margin-top:10px;border:1px solid #dde0e5;font-size:12px}.leadcard strong{display:block;font-size:13px;margin-bottom:8px}.leadcard select{font-size:11px;padding:7px}.flash{padding:11px;background:#fff4d8;border-radius:9px;margin-bottom:12px}.chat{background:#f4f5f7;border-radius:13px;padding:18px;height:390px;overflow:auto}.bubble{max-width:85%;background:#fff;padding:12px;border-radius:12px;margin:8px 0;font-size:14px;line-height:1.5}.bubble.user{margin-left:auto;background:#dcefe6}.chatrow{display:flex;gap:8px;margin-top:12px}.chatrow input{flex:1}.auth{max-width:430px;margin:12vh auto}.help{font-size:12px;color:#757c86;margin-top:7px}.split{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}@media(max-width:850px){.layout{display:block}.sidebar{width:100%;padding:17px}.sub{margin:4px 0 10px}.nav{display:flex;overflow:auto}.nav a{white-space:nowrap}.main{padding:20px 13px}.grid{grid-template-columns:repeat(2,1fr)}.fields,.split{grid-template-columns:1fr}.card{overflow-x:auto}}@media(max-width:450px){.grid{grid-template-columns:1fr 1fr}.metric{font-size:25px}}</style>'''
+BASE_HTML='''<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{title}} | FR Gestão Estratégica</title>'''+STYLE+'''</head><body>{% if logged %}<div class="layout"><aside class="sidebar"><div class="brand">FR<span style="font-weight:300">.</span> Gestão</div><div class="sub">ESTRATÉGICA · SOFIA CRM</div><div class="nav">{% for path,label in nav %}<a class="{{'active' if request.path==path else ''}}" href="{{path}}">{{label}}</a>{% endfor %}</div><div style="margin-top:35px;color:#8e959e;font-size:12px">{{username}} · {{role}}<p><a href="/logout">Sair da conta ↗</a></p></div></aside><main class="main">{% else %}<main class="auth">{% endif %}<div class="top"><div><h1>{{title}}</h1><div class="muted">{{subtitle}}</div></div></div>{% with msgs=get_flashed_messages() %}{% for m in msgs %}<div class="flash">{{m}}</div>{% endfor %}{% endwith %}{{body|safe}}</main>{% if logged %}</div>{% endif %}</body></html>'''
+NAV=[('/','◫  Dashboard'),('/leads','♧  Leads'),('/properties','⌂  Imóveis'),('/pipeline','▥  Funil comercial'),('/visits','▦  Agenda'),('/team','♙  Gestores & equipe'),('/teams','♧  Equipes'),('/sofia','✦  Sofia SDR')]
+
+def page(title,subtitle,body,**ctx):
+ b=render_template_string(body,csrf=csrf(),**({"stages": STAGES} | ctx))
+ return render_template_string(BASE_HTML,title=title,subtitle=subtitle,body=b,logged=bool(session.get('uid')),username=session.get('name'),role=session.get('role'),nav=NAV)
+
+def log(c,lead,kind,details):c.execute('INSERT INTO activities(lead_id,actor_id,kind,details) VALUES(?,?,?,?)',(lead,session.get('uid'),kind,details))
+
+def num(v):
+ try:return float(v) if v else None
+ except:return None
+
+@app.route('/login',methods=['GET','POST'])
+def login():
+ if request.method=='POST':
+  with conn() as c:u=c.execute('SELECT * FROM users WHERE email=?',(request.form.get('email','').lower().strip(),)).fetchone()
+  if u and u['active'] and check_password_hash(u['password'],request.form.get('password','')):
+   session.clear();session.update(uid=u['id'],name=u['name'],role=u['role']);return redirect('/')
+  flash('E-mail ou senha incorretos.')
+ return page('Acesso ao CRM','Entre com suas credenciais','''<div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="field"><label>E-mail</label><input name="email" type="email" required></div><br><div class="field"><label>Senha</label><input name="password" type="password" required></div><br><button class="btn" style="width:100%">Entrar</button></form></div>''')
+@app.route('/logout')
+def logout():session.clear();return redirect('/login')
+@app.route('/')
+@login_required
+def dashboard():
+ with conn() as c:
+  where,args=visible_filter('l')
+  lead_count=c.execute(f'SELECT count(*) FROM leads l WHERE {where}',args).fetchone()[0]; prop_count=c.execute("SELECT count(*) FROM properties WHERE status='Disponível'").fetchone()[0];visits=c.execute("SELECT count(*) FROM visits WHERE status='Agendada'").fetchone()[0];won=c.execute(f"SELECT count(*) FROM leads l WHERE stage='Venda concluída' AND {where}",args).fetchone()[0]
+  recent=c.execute(f'SELECT name,stage,created_at FROM leads l WHERE {where} ORDER BY id DESC LIMIT 8',args).fetchall(); stages=c.execute(f'SELECT stage,count(*) n FROM leads l WHERE {where} GROUP BY stage',args).fetchall()
+ return page('Visão geral','Indicadores e movimentações do seu negócio','''<div class="grid">{% for label,value in metrics %}<div class="card"><div class="label">{{label}}</div><div class="metric">{{value}}</div></div>{% endfor %}</div><div class="split"><div class="card"><h2>Últimos leads</h2><table><tr><th>Cliente</th><th>Etapa</th><th>Entrada</th></tr>{% for l in recent %}<tr><td>{{l.name}}</td><td><span class="pill">{{l.stage}}</span></td><td>{{l.created_at[:10]}}</td></tr>{% endfor %}</table></div><div class="card"><h2>Funil em números</h2>{% for s in stages %}<div style="display:flex;justify-content:space-between;padding:10px;border-bottom:1px solid #eee"><span>{{s.stage}}</span><b>{{s.n}}</b></div>{% endfor %}<p class="help">Cadastre leads para acompanhar conversão por etapa.</p></div></div>''',metrics=[('Leads cadastrados',lead_count),('Imóveis disponíveis',prop_count),('Visitas agendadas',visits),('Vendas concluídas',won)],recent=recent,stages=stages)
+
+@app.route('/leads',methods=['GET','POST'])
+@login_required
+def leads():
+ with conn() as c:
+  if request.method=='POST':
+   f=request.form
+   if not f.get('name','').strip():flash('Informe o nome.');return redirect('/leads')
+   owner=int(f['owner_id']) if f.get('owner_id') else (auto_owner(c) if session.get('role')=='admin' else session['uid'])
+   if not can_assign(c,owner):return 'Responsável não autorizado',403
+   cur=c.execute('INSERT INTO leads(name,phone,email,source,interest,neighborhood,budget,owner_id,notes) VALUES(?,?,?,?,?,?,?,?,?)',(f['name'].strip(),f.get('phone'),f.get('email'),f.get('source'),f.get('interest'),f.get('neighborhood'),num(f.get('budget')),owner,f.get('notes')))
+   log(c,cur.lastrowid,'cadastro','Lead cadastrado');flash('Lead cadastrado.');return redirect('/leads')
+  q=request.args.get('q','').strip();where,args=visible_filter('l');rows=c.execute(f'''SELECT l.*,u.name owner FROM leads l LEFT JOIN users u ON u.id=l.owner_id WHERE ({where}) AND (l.name LIKE ? OR l.phone LIKE ? OR l.neighborhood LIKE ?) ORDER BY l.id DESC''',(*args,*(['%'+q+'%']*3))).fetchall();team=c.execute('SELECT id,name FROM users WHERE active=1 ORDER BY name').fetchall()
+ return page('Leads','Cadastro, qualificação e acompanhamento de clientes','''<div class="card"><h2>Novo lead</h2><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="fields"><div class="field"><label>Nome *</label><input name="name" required></div><div class="field"><label>Telefone</label><input name="phone" placeholder="5562999999999"></div><div class="field"><label>E-mail</label><input name="email" type="email"></div><div class="field"><label>Origem</label><select name="source"><option>Anúncio</option><option>WhatsApp</option><option>Indicação</option><option>Site</option><option>Base antiga</option></select></div><div class="field"><label>Interesse</label><input name="interest" placeholder="Apartamento, casa, lote..."></div><div class="field"><label>Bairro</label><input name="neighborhood"></div><div class="field"><label>Orçamento (R$)</label><input type="number" min="0" step="0.01" name="budget"></div><div class="field"><label>Corretor responsável</label><select name="owner_id"><option value="">Sem responsável</option>{% for u in team %}<option value="{{u.id}}">{{u.name}}</option>{% endfor %}</select></div><div class="field"><label>Observações</label><input name="notes"></div></div><br><button class="btn">Cadastrar lead</button></form></div><div class="card"><form method="get" style="display:flex;gap:8px"><input name="q" value="{{q}}" placeholder="Buscar nome, telefone ou bairro"><button class="btn">Buscar</button></form><table><tr><th>Cliente</th><th>Telefone</th><th>Interesse</th><th>Etapa</th><th>Responsável</th><th></th></tr>{% for l in rows %}<tr><td><b>{{l.name}}</b></td><td>{{l.phone or '—'}}</td><td>{{l.interest or '—'}}</td><td><span class="pill">{{l.stage}}</span></td><td>{{l.owner or '—'}}</td><td><a class="btn secondary small" href="/lead/{{l.id}}">Abrir</a></td></tr>{% endfor %}</table></div>''',rows=rows,team=team,q=q)
+
+@app.route('/lead/<int:id>',methods=['GET','POST'])
+@login_required
+def lead_detail(id):
+ with conn() as c:
+  if not can_access_lead(c,id):return 'Lead não encontrado ou sem permissão',404
+  if request.method=='POST':
+   f=request.form
+   if f.get('action')=='update':
+    owner=int(f['owner_id']) if f.get('owner_id') else None
+    if not can_assign(c,owner):return 'Responsável não autorizado',403
+    c.execute('UPDATE leads SET stage=?,owner_id=?,notes=? WHERE id=?',(f.get('stage') if f.get('stage') in STAGES else STAGES[0],owner,f.get('notes'),id));log(c,id,'atualização','Etapa/responsável/observações alterados')
+   elif f.get('action')=='note':log(c,id,'anotação',f.get('details','')[:2000])
+   flash('Informações salvas.');return redirect('/lead/'+str(id))
+  l=c.execute('SELECT * FROM leads WHERE id=?',(id,)).fetchone()
+  if not l:return 'Lead não encontrado',404
+  team=c.execute('SELECT id,name FROM users').fetchall();acts=c.execute('SELECT * FROM activities WHERE lead_id=? ORDER BY id DESC LIMIT 30',(id,)).fetchall()
+ return page('Ficha do cliente',l['name'],'''<div class="split"><div class="card"><h2>Dados e acompanhamento</h2><p><b>Telefone:</b> {{l.phone or '—'}} | <b>E-mail:</b> {{l.email or '—'}}</p><p><b>Interesse:</b> {{l.interest or '—'}} | <b>Bairro:</b> {{l.neighborhood or '—'}}</p><p><b>Orçamento:</b> R$ {{l.budget or '—'}} | <b>Origem:</b> {{l.source or '—'}}</p><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="update"><div class="field"><label>Etapa</label><select name="stage">{% for s in stages %}<option {{'selected' if s==l.stage else ''}}>{{s}}</option>{% endfor %}</select></div><br><div class="field"><label>Responsável</label><select name="owner_id"><option value="">Sem responsável</option>{% for u in team %}<option value="{{u.id}}" {{'selected' if l.owner_id==u.id else ''}}>{{u.name}}</option>{% endfor %}</select></div><br><div class="field"><label>Observações</label><textarea name="notes">{{l.notes or ''}}</textarea></div><br><button class="btn">Salvar alterações</button></form></div><div class="card"><h2>Histórico de atividades</h2><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="note"><textarea name="details" required placeholder="Registrar ligação, retorno, preferência..."></textarea><br><br><button class="btn secondary">Adicionar anotação</button></form>{% for a in acts %}<p style="border-bottom:1px solid #eee;padding:10px 0;font-size:13px"><b>{{a.kind}}</b> · {{a.created_at}}<br>{{a.details}}</p>{% endfor %}</div></div>''',l=l,team=team,acts=acts)
+
+@app.route('/properties',methods=['GET','POST'])
+@login_required
+def properties():
+ with conn() as c:
+  if request.method=='POST':
+   f=request.form
+   if not f.get('title','').strip():flash('Informe o título.');return redirect('/properties')
+   c.execute('INSERT INTO properties(title,kind,city,neighborhood,bedrooms,price,area,description,status) VALUES(?,?,?,?,?,?,?,?,?)',(f['title'].strip(),f.get('kind'),f.get('city'),f.get('neighborhood'),int(f['bedrooms']) if f.get('bedrooms') else None,num(f.get('price')),num(f.get('area')),f.get('description'),f.get('status')))
+   flash('Imóvel cadastrado.');return redirect('/properties')
+  q=request.args.get('q','');rows=c.execute('SELECT * FROM properties WHERE title LIKE ? OR neighborhood LIKE ? OR city LIKE ? ORDER BY id DESC',('%'+q+'%',)*3).fetchall()
+ return page('Banco de imóveis','Estoque para recomendações e visitas','''<div class="card"><h2>Cadastrar imóvel</h2><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="fields"><div class="field"><label>Título *</label><input name="title" required></div><div class="field"><label>Tipo</label><select name="kind"><option>Apartamento</option><option>Casa</option><option>Lote</option><option>Comercial</option></select></div><div class="field"><label>Cidade</label><input name="city" value="Goiânia"></div><div class="field"><label>Bairro</label><input name="neighborhood"></div><div class="field"><label>Quartos</label><input name="bedrooms" type="number" min="0"></div><div class="field"><label>Preço (R$)</label><input name="price" type="number" min="0" step="0.01"></div><div class="field"><label>Área (m²)</label><input name="area" type="number" min="0" step="0.01"></div><div class="field"><label>Situação</label><select name="status"><option>Disponível</option><option>Reservado</option><option>Vendido</option><option>Indisponível</option></select></div><div class="field"><label>Diferenciais</label><input name="description"></div></div><br><button class="btn">Cadastrar imóvel</button></form></div><div class="card"><form method="get" style="display:flex;gap:8px"><input name="q" value="{{q}}" placeholder="Buscar imóvel, cidade ou bairro"><button class="btn">Buscar</button></form><table><tr><th>Imóvel</th><th>Local</th><th>Quartos</th><th>Preço</th><th>Situação</th><th></th></tr>{% for p in rows %}<tr><td><b>{{p.title}}</b><br><span class="muted">{{p.kind}}</span></td><td>{{p.neighborhood}}, {{p.city}}</td><td>{{p.bedrooms or '—'}}</td><td>R$ {{'%.2f'|format(p.price or 0)}}</td><td><span class="pill">{{p.status}}</span></td><td><a href="/property/{{p.id}}" class="btn secondary small">Editar</a></td></tr>{% endfor %}</table></div>''',rows=rows,q=q)
+@app.route('/property/<int:id>',methods=['GET','POST'])
+@login_required
+def property_detail(id):
+ with conn() as c:
+  if request.method=='POST':
+   f=request.form;c.execute('UPDATE properties SET title=?,kind=?,city=?,neighborhood=?,bedrooms=?,price=?,area=?,description=?,status=? WHERE id=?',(f['title'],f.get('kind'),f.get('city'),f.get('neighborhood'),int(f['bedrooms']) if f.get('bedrooms') else None,num(f.get('price')),num(f.get('area')),f.get('description'),f.get('status'),id));flash('Imóvel atualizado.');return redirect('/properties')
+  p=c.execute('SELECT * FROM properties WHERE id=?',(id,)).fetchone()
+  if not p:return 'Imóvel não encontrado',404
+ return page('Editar imóvel',p['title'],'''<div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="fields">{% for k,label in fields %}<div class="field"><label>{{label}}</label><input name="{{k}}" value="{{p[k] if p[k] is not none else ''}}" required="{{'required' if k=='title' else ''}}"></div>{% endfor %}<div class="field"><label>Situação</label><select name="status">{% for s in ['Disponível','Reservado','Vendido','Indisponível'] %}<option {{'selected' if p.status==s else ''}}>{{s}}</option>{% endfor %}</select></div></div><br><button class="btn">Salvar imóvel</button></form></div>''',p=p,fields=[('title','Título'),('kind','Tipo'),('city','Cidade'),('neighborhood','Bairro'),('bedrooms','Quartos'),('price','Preço'),('area','Área'),('description','Descrição')])
+@app.route('/pipeline')
+@login_required
+def pipeline():
+ with conn() as c:
+  where,args=visible_filter('l');rows=c.execute(f'SELECT id,name,stage,interest,budget FROM leads l WHERE {where} ORDER BY id DESC',args).fetchall()
+ return page('Funil comercial','Mova cada oportunidade para a próxima etapa','''<div class="board">{% for s in stages %}<div class="lane"><b style="font-size:13px">{{s}}</b><span class="muted"> · {{rows|selectattr('stage','equalto',s)|list|length}}</span>{% for l in rows if l.stage==s %}<div class="leadcard"><strong><a href="/lead/{{l.id}}">{{l.name}}</a></strong><div class="muted">{{l.interest or 'Interesse não informado'}}</div><form action="/move/{{l.id}}" method="post" style="margin-top:10px"><input type="hidden" name="_csrf" value="{{csrf}}"><select name="stage" onchange="this.form.submit()">{% for option in stages %}<option {{'selected' if option==l.stage else ''}}>{{option}}</option>{% endfor %}</select></form></div>{% endfor %}</div>{% endfor %}</div>''',rows=rows)
+@app.route('/move/<int:id>',methods=['POST'])
+@login_required
+def move(id):
+ s=request.form.get('stage')
+ if s in STAGES:
+  with conn() as c:
+   if not can_access_lead(c,id):return 'Sem permissão',403
+   c.execute('UPDATE leads SET stage=? WHERE id=?',(s,id));log(c,id,'funil','Movido para '+s)
+ return redirect('/pipeline')
+@app.route('/visits',methods=['GET','POST'])
+@login_required
+def visits():
+ with conn() as c:
+  if request.method=='POST':
+   f=request.form
+   if f.get('action')=='status':
+    v=c.execute('SELECT lead_id FROM visits WHERE id=?',(f.get('id'),)).fetchone()
+    if not v or not can_access_lead(c,v['lead_id']):return 'Sem permissão',403
+    if f.get('status') not in ('Agendada','Confirmada','Realizada','Cancelada'):return 'Status inválido',400
+    c.execute('UPDATE visits SET status=? WHERE id=?',(f.get('status'),f.get('id')))
+   else:
+    if not can_access_lead(c,int(f['lead_id'])):return 'Sem permissão',403
+    if f.get('owner_id') and not can_assign(c,int(f['owner_id'])):return 'Responsável não autorizado',403
+    c.execute('INSERT INTO visits(lead_id,property_id,owner_id,scheduled_at,notes) VALUES(?,?,?,?,?)',(int(f['lead_id']),int(f['property_id']) if f.get('property_id') else None,int(f['owner_id']) if f.get('owner_id') else None,f['scheduled_at'],f.get('notes')))
+    c.execute("UPDATE leads SET stage='Visita agendada' WHERE id=?",(f['lead_id'],));log(c,int(f['lead_id']),'visita','Visita agendada para '+f['scheduled_at'])
+   flash('Agenda atualizada.');return redirect('/visits')
+  where,args=visible_filter('l');leads=c.execute(f'SELECT id,name FROM leads l WHERE {where} ORDER BY name',args).fetchall();props=c.execute("SELECT id,title FROM properties WHERE status='Disponível'").fetchall();team=c.execute('SELECT id,name FROM users').fetchall();rows=c.execute(f'''SELECT v.*,l.name lead,p.title property,u.name owner FROM visits v JOIN leads l ON l.id=v.lead_id LEFT JOIN properties p ON p.id=v.property_id LEFT JOIN users u ON u.id=v.owner_id WHERE {where} ORDER BY v.scheduled_at DESC''',args).fetchall()
+ return page('Agenda de visitas','Organize compromissos e confirme os atendimentos','''<div class="card"><h2>Nova visita</h2><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="fields"><div class="field"><label>Cliente *</label><select name="lead_id" required><option value="">Selecione</option>{% for l in leads %}<option value="{{l.id}}">{{l.name}}</option>{% endfor %}</select></div><div class="field"><label>Imóvel</label><select name="property_id"><option value="">A definir</option>{% for p in props %}<option value="{{p.id}}">{{p.title}}</option>{% endfor %}</select></div><div class="field"><label>Corretor</label><select name="owner_id"><option value="">A definir</option>{% for u in team %}<option value="{{u.id}}">{{u.name}}</option>{% endfor %}</select></div><div class="field"><label>Data e hora *</label><input name="scheduled_at" type="datetime-local" required></div><div class="field"><label>Local / observações</label><input name="notes"></div></div><br><button class="btn">Agendar visita</button></form></div><div class="card"><h2>Compromissos</h2><table><tr><th>Data</th><th>Cliente</th><th>Imóvel</th><th>Corretor</th><th>Status</th></tr>{% for v in rows %}<tr><td>{{v.scheduled_at.replace('T',' ')}}</td><td>{{v.lead}}</td><td>{{v.property or 'A definir'}}</td><td>{{v.owner or 'A definir'}}</td><td><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><input type="hidden" name="action" value="status"><input type="hidden" name="id" value="{{v.id}}"><select name="status" onchange="this.form.submit()">{% for s in ['Agendada','Confirmada','Realizada','Cancelada'] %}<option {{'selected' if v.status==s else ''}}>{{s}}</option>{% endfor %}</select></form></td></tr>{% endfor %}</table></div>''',leads=leads,props=props,team=team,rows=rows)
+@app.route('/teams',methods=['GET','POST'])
+@login_required
+def teams():
+ if session.get('role')!='admin':return 'Acesso restrito',403
+ with conn() as c:
+  if request.method=='POST':
+   f=request.form;name=f.get('name','').strip();manager=int(f['manager_id']) if f.get('manager_id') else None
+   if not name:return 'Nome obrigatório',400
+   if manager and not c.execute("SELECT 1 FROM users WHERE id=? AND role='gestor' AND active=1",(manager,)).fetchone():return 'Gestor inválido',400
+   try:c.execute('INSERT INTO teams(name,manager_id) VALUES(?,?)',(name,manager));flash('Equipe cadastrada.')
+   except sqlite3.IntegrityError:flash('Já existe equipe com esse nome.')
+   return redirect('/teams')
+  rows=c.execute('SELECT t.*,u.name manager,(SELECT count(*) FROM users WHERE team_id=t.id AND active=1) members FROM teams t LEFT JOIN users u ON u.id=t.manager_id ORDER BY t.name').fetchall()
+  managers=c.execute("SELECT id,name FROM users WHERE role='gestor' AND active=1 ORDER BY name").fetchall()
+ return page('Equipes','Cadastre equipes e vincule gestores','''<div class="card"><h2>Nova equipe</h2><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="fields"><div class="field"><label>Nome da equipe</label><input name="name" required></div><div class="field"><label>Gestor</label><select name="manager_id"><option value="">Sem gestor</option>{% for m in managers %}<option value="{{m.id}}">{{m.name}}</option>{% endfor %}</select></div></div><br><button class="btn">Criar equipe</button></form></div><div class="card"><h2>Equipes cadastradas</h2><table><tr><th>Equipe</th><th>Gestor</th><th>Integrantes</th></tr>{% for t in rows %}<tr><td>{{t.name}}</td><td>{{t.manager or 'A definir'}}</td><td>{{t.members}}</td></tr>{% endfor %}</table></div>''',rows=rows,managers=managers)
+
+@app.route('/team',methods=['GET','POST'])
+@login_required
+def team():
+ if session.get('role')!='admin':return 'Acesso restrito',403
+ with conn() as c:
+  if request.method=='POST':
+   f=request.form;role=f.get('role');team_id=int(f['team_id']) if f.get('team_id') else None
+   if role not in ('admin','gestor','corretor'):return 'Perfil inválido',400
+   if team_id and not c.execute('SELECT 1 FROM teams WHERE id=?',(team_id,)).fetchone():return 'Equipe inválida',400
+   if len(f.get('password',''))<10:flash('Senha deve ter pelo menos 10 caracteres.');return redirect('/team')
+   try:c.execute('INSERT INTO users(name,email,password,role,team_id) VALUES(?,?,?,?,?)',(f['name'].strip(),f['email'].lower().strip(),generate_password_hash(f['password']),role,team_id));flash('Usuário criado.')
+   except sqlite3.IntegrityError:flash('Este e-mail já está cadastrado.')
+   return redirect('/team')
+  rows=c.execute('''SELECT u.id,u.name,u.email,u.role,u.active,u.team_id,t.name team,count(l.id) leads FROM users u LEFT JOIN teams t ON t.id=u.team_id LEFT JOIN leads l ON l.owner_id=u.id GROUP BY u.id ORDER BY u.id''').fetchall()
+  groups=c.execute('SELECT id,name FROM teams ORDER BY name').fetchall()
+ return page('Gestores e equipe','Cadastro, edição e controle de acesso','''<div class="card"><h2>Novo usuário</h2><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="fields"><div class="field"><label>Nome</label><input name="name" required></div><div class="field"><label>E-mail</label><input name="email" type="email" required></div><div class="field"><label>Senha (mínimo 10 caracteres)</label><input name="password" type="password" minlength="10" required></div><div class="field"><label>Perfil</label><select name="role"><option value="corretor">Corretor</option><option value="gestor">Gestor</option><option value="admin">Administrador</option></select></div><div class="field"><label>Equipe</label><select name="team_id"><option value="">Sem equipe</option>{% for g in groups %}<option value="{{g.id}}">{{g.name}}</option>{% endfor %}</select></div></div><br><button class="btn">Adicionar usuário</button></form></div><div class="card"><h2>Equipe cadastrada</h2><table><tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th>Equipe</th><th>Situação</th><th>Leads</th><th></th></tr>{% for u in rows %}<tr><td>{{u.name}}</td><td>{{u.email}}</td><td>{{u.role}}</td><td>{{u.team or '—'}}</td><td>{{'Ativo' if u.active else 'Inativo'}}</td><td>{{u.leads}}</td><td><a class="btn secondary small" href="/user/{{u.id}}">Editar</a></td></tr>{% endfor %}</table></div><p class="help">Para preservar o histórico, a exclusão de usuário é feita por desativação. Leads existentes permanecem vinculados até redistribuição.</p>''',rows=rows,groups=groups)
+
+@app.route('/user/<int:id>',methods=['GET','POST'])
+@login_required
+@admin_required
+def edit_user(id):
+ with conn() as c:
+  u=c.execute('SELECT * FROM users WHERE id=?',(id,)).fetchone()
+  if not u:return 'Usuário não encontrado',404
+  if request.method=='POST':
+   f=request.form;role=f.get('role');active=1 if f.get('active')=='1' else 0
+   tid=int(f['team_id']) if f.get('team_id') else None
+   if role not in ('admin','gestor','corretor'):return 'Perfil inválido',400
+   if tid and not c.execute('SELECT 1 FROM teams WHERE id=?',(tid,)).fetchone():return 'Equipe inválida',400
+   if id==session['uid'] and (role!='admin' or not active):return 'Não é possível retirar seu próprio acesso administrativo',400
+   if not active and u['role']=='admin' and c.execute("SELECT count(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]<=1:return 'É necessário manter um administrador ativo',400
+   try:
+    c.execute('UPDATE users SET name=?,email=?,role=?,team_id=?,active=? WHERE id=?',(f['name'].strip(),f['email'].lower().strip(),role,tid,active,id))
+    if f.get('password'):
+     if len(f['password'])<10:return 'Senha deve ter 10 caracteres',400
+     c.execute('UPDATE users SET password=? WHERE id=?',(generate_password_hash(f['password']),id))
+   except sqlite3.IntegrityError:return 'E-mail já cadastrado',400
+   flash('Usuário atualizado.');return redirect('/team')
+  groups=c.execute('SELECT id,name FROM teams ORDER BY name').fetchall()
+ return page('Editar usuário',u['name'],'''<div class="card"><form method="post"><input type="hidden" name="_csrf" value="{{csrf}}"><div class="fields"><div class="field"><label>Nome</label><input name="name" value="{{u.name}}" required></div><div class="field"><label>E-mail</label><input name="email" type="email" value="{{u.email}}" required></div><div class="field"><label>Perfil</label><select name="role">{% for r in ['admin','gestor','corretor'] %}<option value="{{r}}" {{'selected' if u.role==r else ''}}>{{r}}</option>{% endfor %}</select></div><div class="field"><label>Equipe</label><select name="team_id"><option value="">Sem equipe</option>{% for g in groups %}<option value="{{g.id}}" {{'selected' if u.team_id==g.id else ''}}>{{g.name}}</option>{% endfor %}</select></div><div class="field"><label>Situação</label><select name="active"><option value="1" {{'selected' if u.active else ''}}>Ativo</option><option value="0" {{'selected' if not u.active else ''}}>Desativado</option></select></div><div class="field"><label>Nova senha (opcional)</label><input type="password" name="password" minlength="10" placeholder="Deixe em branco para manter"></div></div><br><button class="btn">Salvar alterações</button> <a href="/team" class="btn secondary">Voltar</a></form></div>''',u=u,groups=groups)
+
+@app.route('/sofia')
+@login_required
+def sofia():
+ return page('Sofia SDR','Simulador de pré-vendas conectado ao estoque local','''<div class="split"><div class="card"><h2>Atendimento demonstrativo</h2><div class="chat" id="chat"><div class="bubble">Olá! 😊 Sou a Sofia, da FR Gestão Estratégica. Você procura apartamento, casa ou lote?</div></div><div class="chatrow"><input id="msg" placeholder="Ex.: Apartamento no Bueno até 700 mil" onkeydown="if(event.key==='Enter')send()"><button class="btn" onclick="send()">Enviar</button></div><p class="help">Simulador por regras: não envia mensagens pelo WhatsApp nem utiliza IA externa.</p></div><div class="card"><h2>Diretrizes de atendimento</h2><p>✓ Mensagens curtas e naturais</p><p>✓ Uma pergunta por vez</p><p>✓ Até 3 imóveis disponíveis por sugestão</p><p>✓ Preço somente do cadastro atualizado</p><p>✓ Convite para visita com corretor</p><p>✓ Encaminhamento de dúvidas complexas</p><hr><p class="muted">Para operação real, configurar WhatsApp Business Platform, provedor de IA, opt-in, modelos de mensagem e encaminhamento humano.</p></div></div><script>async function send(){let i=document.getElementById('msg'),t=i.value.trim();if(!t)return;let c=document.getElementById('chat');function bubble(x,cls){let d=document.createElement('div');d.className='bubble '+cls;d.textContent=x;c.appendChild(d);c.scrollTop=c.scrollHeight;}bubble(t,'user');i.value='';try{let r=await fetch('/api/sofia',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':'{{csrf}}'},body:JSON.stringify({message:t})});let d=await r.json();bubble(d.reply||'Não consegui responder agora.','')}catch(e){bubble('Não foi possível conectar ao simulador.','')}} </script>''')
+@app.route('/api/sofia',methods=['POST'])
+@login_required
+def sofia_api():
+ if request.headers.get('X-CSRF-Token')!=csrf():return jsonify(error='CSRF'),403
+ text=(request.json or {}).get('message','')[:500];lower=text.lower()
+ if re.search(r'jur[ií]dic|contrato|desconto|financiamento|proposta',lower):return jsonify(reply='Essa questão merece uma análise cuidadosa. Posso encaminhar você para um corretor especialista?')
+ kind=next((k for k in ['apartamento','casa','lote'] if k in lower),None)
+ words=['bueno','marista','jardim goiás','sudoeste','oeste','areião','senador canedo','nerópolis']
+ bairro=next((k for k in words if k in lower),None)
+ match=re.search(r'(?:at[eé]|r\$)\s*([\d.,]+)\s*(milh[oõ]es|mil|k)?',lower)
+ budget=None
+ if match:
+  try:
+   budget=float(match.group(1).replace('.','').replace(',','.'))*({'mil':1000,'k':1000,'milhões':1000000}.get(match.group(2),1))
+  except:pass
+ with conn() as c:props=c.execute("SELECT * FROM properties WHERE status='Disponível' ORDER BY id DESC").fetchall()
+ matches=[p for p in props if (not kind or (p['kind'] or '').lower()==kind) and (not bairro or bairro in (p['neighborhood'] or '').lower() or bairro in (p['city'] or '').lower()) and (not budget or (p['price'] is not None and p['price']<=budget))][:3]
+ if matches:
+  parts=[f"{p['title']} — {p['neighborhood'] or p['city'] or 'local a confirmar'} — R$ {p['price']:,.2f}".replace(',','X').replace('.',',').replace('X','.') if p['price'] is not None else f"{p['title']} — preço sob consulta" for p in matches]
+  return jsonify(reply='Encontrei estas opções disponíveis no nosso cadastro:\n'+'\n'.join(parts)+'\nQual delas chamou mais sua atenção?')
+ if props:return jsonify(reply='Não encontrei uma opção disponível com esses critérios no estoque atual. Você gostaria de ampliar a região ou o orçamento?')
+ return jsonify(reply='Vou ajudar você a encontrar uma boa opção! Ainda estamos cadastrando nosso estoque. Em qual bairro você gostaria de procurar?')
+
+@app.route('/api/whatsapp',methods=['GET','POST'])
+def api_whatsapp():
+ # Endpoint propositalmente inativo até autenticação/assinatura de webhook e configuração Meta.
+ return jsonify(status='not_configured',message='Integração WhatsApp não configurada'),503
+
+if __name__=='__main__':
+ print('Abra http://127.0.0.1:5000 no navegador',flush=True)
+ app.run(host='127.0.0.1',port=int(os.environ.get('PORT',5000)),debug=False)
