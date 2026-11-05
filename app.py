@@ -46,7 +46,10 @@ class PgConnection:
  def execute(self, sql, args=()):
   sql=sql.replace('?', '%s')
   is_insert=sql.lstrip().upper().startswith('INSERT INTO')
-  if is_insert and 'RETURNING' not in sql.upper(): sql += ' RETURNING id'
+  # Only tables with an integer id support RETURNING id.
+  # whatsapp_events uses message_id as its primary key.
+  returns_id = is_insert and not sql.lstrip().upper().startswith('INSERT INTO WHATSAPP_EVENTS')
+  if returns_id and 'RETURNING' not in sql.upper(): sql += ' RETURNING id'
   self.raw.execute('SAVEPOINT sofia_stmt')
   try:
    cursor=self.raw.execute(sql, tuple(args))
@@ -55,7 +58,7 @@ class PgConnection:
    self.raw.execute('ROLLBACK TO SAVEPOINT sofia_stmt')
    self.raw.execute('RELEASE SAVEPOINT sofia_stmt')
    raise
-  if is_insert:
+  if returns_id:
    row=cursor.fetchone()
    return PgResult(cursor, row['id'] if row else None)
   return PgResult(cursor)
