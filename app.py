@@ -1,4 +1,4 @@
-import os, sqlite3, secrets, re
+import os, sqlite3, secrets, re, hmac, hashlib, logging
 from psycopg import connect as pg_connect, IntegrityError as PGIntegrityError
 from psycopg.rows import dict_row
 from datetime import datetime
@@ -155,7 +155,7 @@ def csrf():
  return session['_csrf']
 @app.before_request
 def protect():
- if request.method=='POST' and request.endpoint not in ('api_whatsapp',):
+ if request.method=='POST' and request.endpoint not in ('api_whatsapp','whatsapp_webhook'):
   if not secrets.compare_digest(request.form.get('_csrf',''),csrf()):return 'Solicitação inválida (CSRF)',400
 
 STYLE='''<style>*{box-sizing:border-box}body{margin:0;background:#f5f6f8;color:#17191c;font-family:Inter,Arial,sans-serif}a{color:inherit;text-decoration:none}.layout{display:flex;min-height:100vh}.sidebar{width:245px;background:#101215;color:white;padding:28px 17px;flex-shrink:0}.brand{font-size:22px;font-weight:850;letter-spacing:-.6px}.sub{font-size:11px;color:#aab0b8;margin:6px 0 28px;letter-spacing:2px}.nav a{display:block;padding:12px 14px;border-radius:10px;margin:4px 0;color:#cdd0d5;font-size:14px}.nav a:hover,.nav a.active{background:#2b3036;color:#fff}.main{padding:30px 34px;width:100%;min-width:0}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:15px}.muted{color:#747b86;font-size:13px}h1{font-size:27px;letter-spacing:-.7px;margin:0 0 7px}h2{font-size:18px;margin:0 0 16px}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px}.card{background:white;border:1px solid #e6e8ed;border-radius:15px;padding:20px;margin-bottom:17px;box-shadow:0 2px 6px #00000004}.metric{font-size:32px;font-weight:800;margin-top:12px}.label{color:#777e87;font-size:12px;text-transform:uppercase;letter-spacing:.7px}table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#6c7480;font-weight:600;border-bottom:1px solid #e8eaf0;padding:13px 10px}td{border-bottom:1px solid #f0f1f3;padding:13px 10px}input,select,textarea{padding:11px 12px;border:1px solid #d9dde3;border-radius:9px;width:100%;background:white;font:inherit;color:#17191c}textarea{min-height:76px}.fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.field label{display:block;font-size:12px;color:#555d66;margin-bottom:6px}.btn{display:inline-block;background:#111418;color:#fff;padding:11px 15px;border:0;border-radius:9px;cursor:pointer;font-size:13px;font-weight:650}.btn.secondary{background:#e9ecf0;color:#20242a}.btn.small{padding:7px 10px}.pill{background:#f0f2f4;border-radius:50px;padding:5px 9px;font-size:11px;white-space:nowrap}.board{display:flex;gap:12px;overflow-x:auto;padding-bottom:10px}.lane{background:#e9ecf0;border-radius:13px;padding:13px;min-width:205px;max-width:205px;min-height:230px}.leadcard{background:#fff;border-radius:10px;padding:13px;margin-top:10px;border:1px solid #dde0e5;font-size:12px}.leadcard strong{display:block;font-size:13px;margin-bottom:8px}.leadcard select{font-size:11px;padding:7px}.flash{padding:11px;background:#fff4d8;border-radius:9px;margin-bottom:12px}.chat{background:#f4f5f7;border-radius:13px;padding:18px;height:390px;overflow:auto}.bubble{max-width:85%;background:#fff;padding:12px;border-radius:12px;margin:8px 0;font-size:14px;line-height:1.5}.bubble.user{margin-left:auto;background:#dcefe6}.chatrow{display:flex;gap:8px;margin-top:12px}.chatrow input{flex:1}.auth{max-width:430px;margin:12vh auto}.help{font-size:12px;color:#757c86;margin-top:7px}.split{display:grid;grid-template-columns:1.4fr 1fr;gap:16px}@media(max-width:850px){.layout{display:block}.sidebar{width:100%;padding:17px}.sub{margin:4px 0 10px}.nav{display:flex;overflow:auto}.nav a{white-space:nowrap}.main{padding:20px 13px}.grid{grid-template-columns:repeat(2,1fr)}.fields,.split{grid-template-columns:1fr}.card{overflow-x:auto}}@media(max-width:450px){.grid{grid-template-columns:1fr 1fr}.metric{font-size:25px}}</style>'''
@@ -360,6 +360,34 @@ def sofia_api():
   return jsonify(reply='Encontrei estas opções disponíveis no nosso cadastro:\n'+'\n'.join(parts)+'\nQual delas chamou mais sua atenção?')
  if props:return jsonify(reply='Não encontrei uma opção disponível com esses critérios no estoque atual. Você gostaria de ampliar a região ou o orçamento?')
  return jsonify(reply='Vou ajudar você a encontrar uma boa opção! Ainda estamos cadastrando nosso estoque. Em qual bairro você gostaria de procurar?')
+
+@app.route('/webhook', methods=['GET', 'POST'])
+def whatsapp_webhook():
+ # Meta verifies the callback with a GET request; respond with the raw challenge.
+ if request.method == 'GET':
+  token = os.environ.get('WHATSAPP_VERIFY_TOKEN', '')
+  mode = request.args.get('hub.mode', '')
+  provided = request.args.get('hub.verify_token', '')
+  challenge = request.args.get('hub.challenge')
+  if token and mode == 'subscribe' and hmac.compare_digest(provided, token) and challenge is not None:
+   return challenge, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+  return 'Verificação não autorizada', 403
+
+ # Every POST must have a valid HMAC-SHA256 signature from Meta.
+ app_secret = os.environ.get('META_APP_SECRET', '')
+ signature = request.headers.get('X-Hub-Signature-256', '')
+ if not app_secret or not signature.startswith('sha256='):
+  return jsonify(error='Assinatura ausente ou integração não configurada'), 403
+ payload = request.get_data(cache=True)
+ expected = 'sha256=' + hmac.new(app_secret.encode('utf-8'), payload, hashlib.sha256).hexdigest()
+ if not hmac.compare_digest(signature, expected):
+  return jsonify(error='Assinatura inválida'), 403
+ data = request.get_json(silent=True)
+ if not isinstance(data, dict) or data.get('object') != 'whatsapp_business_account':
+  return jsonify(error='Evento inválido'), 400
+ # Acknowledge the event. Lead creation and automated replies are NOT enabled yet.
+ logging.getLogger(__name__).info('Webhook WhatsApp recebido e autenticado')
+ return jsonify(status='received'), 200
 
 @app.route('/api/whatsapp',methods=['GET','POST'])
 def api_whatsapp():
