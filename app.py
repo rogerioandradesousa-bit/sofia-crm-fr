@@ -385,9 +385,55 @@ def whatsapp_webhook():
  data = request.get_json(silent=True)
  if not isinstance(data, dict) or data.get('object') != 'whatsapp_business_account':
   return jsonify(error='Evento inválido'), 400
- # Acknowledge the event. Lead creation and automated replies are NOT enabled yet.
- logging.getLogger(__name__).info('Webhook WhatsApp recebido e autenticado')
- return jsonify(status='received'), 200
+ # Only inbound messages create leads. Status notifications are ignored.
+ processed = 0
+ with conn() as c:
+  if DATABASE_URL:
+   c.execute("CREATE TABLE IF NOT EXISTS whatsapp_events (message_id TEXT PRIMARY KEY, lead_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+  else:
+   c.execute("CREATE TABLE IF NOT EXISTS whatsapp_events (message_id TEXT PRIMARY KEY, lead_id INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+  for entry in data.get('entry', []):
+   if not isinstance(entry, dict): continue
+   for change in entry.get('changes', []):
+    if not isinstance(change, dict) or change.get('field') != 'messages': continue
+    value = change.get('value') or {}
+    if not isinstance(value, dict): continue
+    profiles = {}
+    for contact in value.get('contacts', []):
+     if isinstance(contact, dict):
+      wa_id = str(contact.get('wa_id') or '')
+      profiles[wa_id] = str((contact.get('profile') or {}).get('name') or '').strip()[:150]
+    for message in value.get('messages', []):
+     if not isinstance(message, dict): continue
+     message_id = str(message.get('id') or '')[:255]
+     phone = re.sub(r'\D', '', str(message.get('from') or ''))
+     if not message_id or not (8 <= len(phone) <= 15): continue
+     # Insert first; an existing message ID means a retry from Meta.
+     try:
+      c.execute('INSERT INTO whatsapp_events(message_id) VALUES(?)', (message_id,))
+     except (sqlite3.IntegrityError, PGIntegrityError):
+      continue
+     lead = c.execute('SELECT id FROM leads WHERE phone=? ORDER BY id LIMIT 1', (phone,)).fetchone()
+     if lead:
+      lead_id = lead['id']
+     else:
+      name = profiles.get(phone) or ('WhatsApp ' + phone)
+      owner = auto_owner(c)
+      cur = c.execute('INSERT INTO leads(name,phone,source,stage,owner_id,notes) VALUES(?,?,?,?,?,?)',
+                      (name, phone, 'WhatsApp', STAGES[0], owner, 'Lead recebido automaticamente pelo WhatsApp.'))
+      lead_id = cur.lastrowid
+      c.execute('INSERT INTO activities(lead_id,actor_id,kind,details) VALUES(?,?,?,?)',
+                (lead_id, None, 'cadastro', 'Lead cadastrado automaticamente pelo WhatsApp'))
+     content = message.get('text') or {}
+     body = str(content.get('body') or '').strip() if isinstance(content, dict) else ''
+     kind = str(message.get('type') or 'desconhecido')[:40]
+     detail = ('Mensagem recebida: ' + body[:1500]) if kind == 'text' and body else ('Mensagem recebida (tipo: ' + kind + ')')
+     c.execute('INSERT INTO activities(lead_id,actor_id,kind,details) VALUES(?,?,?,?)',
+               (lead_id, None, 'WhatsApp', detail))
+     c.execute('UPDATE whatsapp_events SET lead_id=? WHERE message_id=?', (lead_id, message_id))
+     processed += 1
+ logging.getLogger(__name__).info('Webhook WhatsApp autenticado: %s mensagens processadas', processed)
+ return jsonify(status='received', processed=processed), 200
 
 @app.route('/api/whatsapp',methods=['GET','POST'])
 def api_whatsapp():
